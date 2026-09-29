@@ -61,27 +61,22 @@ function App() {
   const [selectedFinding, setSelectedFinding] = useState<string | null>(null)
   const [studies, setStudies] = useState<SavedStudy[]>([])
   const [savedFlash, setSavedFlash] = useState(false)
+  const [patientId, setPatientId] = useState('')
+  const [patientAge, setPatientAge] = useState('')
+  const [patientSex, setPatientSex] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // Load saved studies from localStorage on mount
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
-      if (raw) {
-        const parsed = JSON.parse(raw) as SavedStudy[]
-        setStudies(parsed)
-      }
-    } catch (e) {
-      console.warn('Could not load saved studies:', e)
-    }
+      if (raw) setStudies(JSON.parse(raw) as SavedStudy[])
+    } catch {}
   }, [])
 
   const persistStudies = (list: SavedStudy[]) => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
-    } catch (e) {
-      console.warn('Could not persist studies:', e)
-    }
+    } catch {}
   }
 
   const handleFile = (f: File) => {
@@ -119,17 +114,11 @@ function App() {
       form.append('file', file)
 
       const res = await fetch(`${API_BASE}/predict`, { method: 'POST', body: form })
-
-      if (!res.ok) {
-        throw new Error(`Server error (HTTP ${res.status}). Please try again.`)
-      }
+      if (!res.ok) throw new Error(`Server error (HTTP ${res.status}). Please try again.`)
 
       const raw = await res.text()
-      if (!raw || raw.trim() === '') {
-        throw new Error('Empty response. Please try again.')
-      }
-      if (raw.trim() === 'null') {
-        throw new Error('Backend returned no data. Please try again.')
+      if (!raw || raw.trim() === '' || raw.trim() === 'null') {
+        throw new Error('Empty response from server. Please try again.')
       }
 
       let data: PredictResponse
@@ -155,7 +144,6 @@ function App() {
     }
   }
 
-  // Create a tiny thumbnail from the preview image
   const makeThumbnail = async (dataUrl: string): Promise<string | null> => {
     return new Promise((resolve) => {
       const img = new Image()
@@ -166,7 +154,6 @@ function App() {
         canvas.height = size
         const ctx = canvas.getContext('2d')
         if (!ctx) return resolve(null)
-        // Cover-fit
         const scale = Math.max(size / img.width, size / img.height)
         const w = img.width * scale
         const h = img.height * scale
@@ -180,12 +167,7 @@ function App() {
 
   const saveCurrentStudy = async () => {
     if (!result || result.rejected || !result.top_finding) return
-
-    let thumbnail: string | null = null
-    if (preview) {
-      thumbnail = await makeThumbnail(preview)
-    }
-
+    const thumbnail = preview ? await makeThumbnail(preview) : null
     const study: SavedStudy = {
       id: `s_${Date.now()}`,
       timestamp: Date.now(),
@@ -197,7 +179,6 @@ function App() {
       flagged: result.flagged ?? false,
       findings: result.findings,
     }
-
     const next = [study, ...studies].slice(0, MAX_STUDIES)
     setStudies(next)
     persistStudies(next)
@@ -206,8 +187,7 @@ function App() {
   }
 
   const loadStudy = (s: SavedStudy) => {
-    // Reconstruct a minimal PredictResponse from the saved study
-    const reconstructed: PredictResponse = {
+    setResult({
       filename: s.filename,
       rejected: false,
       threshold: s.threshold,
@@ -218,8 +198,7 @@ function App() {
       heatmap_base64: null,
       heatmaps: {},
       mc_passes: 10,
-    }
-    setResult(reconstructed)
+    })
     setPreview(s.thumbnail)
     setFile(null)
     setShowHeatmap(false)
@@ -249,6 +228,173 @@ function App() {
     if (inputRef.current) inputRef.current.value = ''
   }
 
+  // ------------------------------------------------
+  // Generate printable report in a new window
+  // ------------------------------------------------
+  const generateReport = () => {
+    if (!result || result.rejected) return
+
+    const topHeatmap = result.heatmap_base64 ?? null
+    const now = new Date()
+    const studyId = `NX-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`
+
+    const findingsRows = result.findings
+      .map((f) => {
+        const flag = f.severity === 'high' ? 'HIGH' : f.severity === 'moderate' ? 'MOD' : 'LOW'
+        return `<tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;">${f.label}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right;font-family:monospace;">${(f.score * 100).toFixed(1)}%</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right;font-family:monospace;color:#64748b;">±${((f.std ?? 0) * 100).toFixed(1)}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right;">
+            <span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:0.05em;${
+              f.severity === 'high'
+                ? 'background:#fee2e2;color:#991b1b;'
+                : f.severity === 'moderate'
+                ? 'background:#fef3c7;color:#92400e;'
+                : 'background:#e2e8f0;color:#475569;'
+            }">${flag}</span>
+          </td>
+        </tr>`
+      })
+      .join('')
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Navantix Pulmo Report ${studyId}</title>
+  <style>
+    @page { size: A4; margin: 15mm; }
+    body { font-family: 'Helvetica', 'Arial', sans-serif; color: #1a1f2e; font-size: 11pt; line-height: 1.5; margin: 0; padding: 0; }
+    h1 { font-size: 16pt; margin: 0 0 2px 0; letter-spacing: 0.05em; }
+    .sub { font-size: 9pt; color: #64748b; letter-spacing: 0.12em; text-transform: uppercase; font-family: monospace; }
+    .header { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2px solid #0a1628; padding-bottom: 10px; margin-bottom: 20px; }
+    .logo { font-size: 22pt; font-weight: 700; }
+    .logo span { color: #2563eb; }
+    .section { margin-bottom: 20px; }
+    .section-title { font-size: 9pt; font-weight: 700; color: #64748b; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 8px; font-family: monospace; }
+    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 20px; font-size: 10pt; }
+    .meta-row { display: flex; justify-content: space-between; border-bottom: 1px solid #eef2f7; padding: 4px 0; }
+    .meta-row .k { color: #64748b; }
+    .meta-row .v { font-family: monospace; font-weight: 500; }
+    .banner { padding: 10px 14px; border-radius: 4px; font-weight: 600; font-size: 10pt; }
+    .banner-flag { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+    .banner-clear { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .image-box { border: 1px solid #e2e8f0; border-radius: 4px; padding: 6px; background: white; }
+    .image-box img { width: 100%; display: block; border-radius: 3px; }
+    table { width: 100%; border-collapse: collapse; font-size: 10pt; }
+    th { text-align: left; padding: 6px 10px; font-size: 8.5pt; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase; border-bottom: 2px solid #0a1628; font-family: monospace; }
+    .disclaimer { margin-top: 25px; padding: 12px 16px; background: #f8fafc; border-left: 3px solid #64748b; font-size: 9pt; color: #475569; line-height: 1.6; }
+    .footer { margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 10px; font-size: 8pt; color: #94a3b8; font-family: monospace; letter-spacing: 0.05em; display: flex; justify-content: space-between; }
+    .no-print { display: block; margin-top: 20px; text-align: center; }
+    .no-print button { background: #0a1628; color: white; border: none; padding: 12px 24px; font-size: 11pt; border-radius: 4px; cursor: pointer; font-weight: 500; }
+    @media print { .no-print { display: none; } body { font-size: 10pt; } }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <div class="logo">N<span>+</span></div>
+      <h1>NAVANTIX PULMO</h1>
+      <div class="sub">AI-Assisted Chest Radiograph Analysis</div>
+    </div>
+    <div style="text-align:right;">
+      <div class="sub">Study ID</div>
+      <div style="font-family:monospace;font-weight:600;font-size:11pt;">${studyId}</div>
+      <div class="sub" style="margin-top:6px;">Generated</div>
+      <div style="font-family:monospace;font-size:10pt;">${now.toLocaleString('en-GB')}</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Study Information</div>
+    <div class="meta-grid">
+      <div class="meta-row"><span class="k">Patient ID</span><span class="v">${patientId || '—'}</span></div>
+      <div class="meta-row"><span class="k">Age</span><span class="v">${patientAge || '—'}</span></div>
+      <div class="meta-row"><span class="k">Sex</span><span class="v">${patientSex || '—'}</span></div>
+      <div class="meta-row"><span class="k">File</span><span class="v">${result.filename.slice(0, 28)}</span></div>
+      <div class="meta-row"><span class="k">Model</span><span class="v">DenseNet-121</span></div>
+      <div class="meta-row"><span class="k">MC Passes</span><span class="v">${result.mc_passes ?? 10}</span></div>
+      <div class="meta-row"><span class="k">Inference</span><span class="v">${(result.elapsed_ms ?? 0).toFixed(0)} ms</span></div>
+      <div class="meta-row"><span class="k">Threshold</span><span class="v">${((result.threshold ?? 0.5) * 100).toFixed(0)}%</span></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="banner ${
+      result.flagged ? 'banner-flag' : 'banner-clear'
+    }">${result.flagged ? '! ' : '✓ '}${result.flagged
+      ? 'Pathologies flagged above clinical threshold'
+      : 'No pathologies flagged above clinical threshold'}</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Radiograph & AI Attention</div>
+    <div class="two-col">
+      <div>
+        <div class="image-box">
+          <img src="${preview}" alt="Radiograph">
+        </div>
+        <div style="font-size:9pt;color:#64748b;text-align:center;margin-top:6px;font-style:italic;">Original radiograph</div>
+      </div>
+      <div>
+        ${
+          topHeatmap
+            ? `<div class="image-box">
+                <img src="data:image/png;base64,${topHeatmap}" alt="Attention overlay">
+              </div>
+              <div style="font-size:9pt;color:#64748b;text-align:center;margin-top:6px;font-style:italic;">Grad-CAM++ overlay for top finding: ${result.top_finding}</div>`
+            : `<div class="image-box" style="height:200px;display:flex;align-items:center;justify-content:center;color:#cbd5e1;font-size:10pt;">No heatmap available</div>`
+        }
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Diagnostic Probabilities (18 labels)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Finding</th>
+          <th style="text-align:right;">Probability</th>
+          <th style="text-align:right;">Uncertainty (±)</th>
+          <th style="text-align:right;">Severity</th>
+        </tr>
+      </thead>
+      <tbody>${findingsRows}</tbody>
+    </table>
+  </div>
+
+  <div class="disclaimer">
+    <strong>Clinical Disclaimer.</strong> This output is generated by a research prototype and is
+    <strong>not a medical diagnosis</strong>. It is intended for investigational and educational use only.
+    All findings must be reviewed by a qualified radiologist or clinician before any clinical decision.
+    The ± value is the standard deviation across ${result.mc_passes ?? 10} Monte Carlo Dropout passes and
+    represents a proxy for predictive uncertainty, not a statistical guarantee of correctness.
+    Heatmaps are anatomically constrained to lung fields and cardiac silhouette using PSPNet segmentation.
+  </div>
+
+  <div class="footer">
+    <div>NAVANTIX PULMO v1.0 · RESEARCH PROTOTYPE · NOT FOR CLINICAL USE</div>
+    <div>BUILT IN GHANA · STUDY ${studyId}</div>
+  </div>
+
+  <div class="no-print">
+    <button onclick="window.print()">Print / Save as PDF</button>
+  </div>
+</body>
+</html>`
+
+    const w = window.open('', '_blank')
+    if (!w) {
+      alert('Please allow pop-ups for this site to generate a report.')
+      return
+    }
+    w.document.write(html)
+    w.document.close()
+  }
+
   const currentHeatmap = (() => {
     if (!result?.heatmaps) return result?.heatmap_base64 ?? null
     if (selectedFinding && result.heatmaps[selectedFinding]) {
@@ -269,15 +415,13 @@ function App() {
       ).length
     : 0
 
-  const formatTime = (ts: number) => {
-    const d = new Date(ts)
-    return d.toLocaleString('en-GB', {
+  const formatTime = (ts: number) =>
+    new Date(ts).toLocaleString('en-GB', {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',
       minute: '2-digit',
     })
-  }
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -409,16 +553,56 @@ function App() {
             </div>
 
             {result && !result.rejected && (
-              <button
-                onClick={saveCurrentStudy}
-                className={`mt-3 w-full px-5 py-3 rounded-md font-medium text-sm transition-colors ${
-                  savedFlash
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-slate-900 text-white hover:bg-slate-800'
-                }`}
-              >
-                {savedFlash ? '✓ Saved to Recent Studies' : 'Save Study'}
-              </button>
+              <div className="mt-5 p-4 bg-white border border-slate-200 rounded-lg">
+                <div className="text-[10px] font-semibold text-slate-500 tracking-[0.14em] uppercase mb-3">
+                  Patient Information (optional)
+                </div>
+                <div className="grid grid-cols-3 gap-2 mb-4">
+                  <input
+                    type="text"
+                    placeholder="Patient ID"
+                    value={patientId}
+                    onChange={(e) => setPatientId(e.target.value)}
+                    className="px-3 py-2 text-xs border border-slate-200 rounded-md focus:outline-none focus:border-blue-400"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Age"
+                    value={patientAge}
+                    onChange={(e) => setPatientAge(e.target.value)}
+                    className="px-3 py-2 text-xs border border-slate-200 rounded-md focus:outline-none focus:border-blue-400"
+                  />
+                  <select
+                    value={patientSex}
+                    onChange={(e) => setPatientSex(e.target.value)}
+                    className="px-3 py-2 text-xs border border-slate-200 rounded-md focus:outline-none focus:border-blue-400 bg-white"
+                  >
+                    <option value="">Sex</option>
+                    <option value="M">Male</option>
+                    <option value="F">Female</option>
+                    <option value="O">Other</option>
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={saveCurrentStudy}
+                    className={`px-4 py-2.5 rounded-md font-medium text-sm transition-colors ${
+                      savedFlash
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-900 text-white hover:bg-slate-800'
+                    }`}
+                  >
+                    {savedFlash ? '✓ Saved' : 'Save Study'}
+                  </button>
+                  <button
+                    onClick={generateReport}
+                    className="px-4 py-2.5 rounded-md font-medium text-sm bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  >
+                    Generate Report (PDF)
+                  </button>
+                </div>
+              </div>
             )}
 
             {error && (
@@ -485,8 +669,7 @@ function App() {
                         {lowConfidenceCount > 1 ? 's' : ''}
                       </div>
                       <div className="text-amber-700">
-                        High variance detected across MC passes. Radiologist review
-                        recommended for flagged findings with LOW confidence.
+                        High variance detected across MC passes. Radiologist review recommended.
                       </div>
                     </div>
                   </div>
@@ -640,7 +823,6 @@ function App() {
           </section>
         </div>
 
-        {/* Recent Studies */}
         {studies.length > 0 && (
           <section className="mt-12">
             <div className="flex items-center justify-between mb-4">
