@@ -1,11 +1,15 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const API_BASE = 'http://127.0.0.1:8000'
+const STORAGE_KEY = 'navantix_studies_v1'
+const MAX_STUDIES = 20
 
 type Prediction = {
   label: string
   score: number
+  std: number
   severity: 'high' | 'moderate' | 'low'
+  confidence: 'high' | 'medium' | 'low'
 }
 
 type ModalityInfo = {
@@ -26,11 +30,25 @@ type PredictResponse = {
   threshold?: number
   top_finding?: string
   top_score?: number
+  top_std?: number
   flagged?: boolean
   findings: Prediction[]
   heatmap_base64: string | null
   heatmaps?: Record<string, string>
   modality?: ModalityInfo
+  mc_passes?: number
+}
+
+type SavedStudy = {
+  id: string
+  timestamp: number
+  filename: string
+  thumbnail: string | null
+  threshold: number
+  top_finding: string
+  top_score: number
+  flagged: boolean
+  findings: Prediction[]
 }
 
 function App() {
@@ -41,7 +59,30 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [showHeatmap, setShowHeatmap] = useState(false)
   const [selectedFinding, setSelectedFinding] = useState<string | null>(null)
+  const [studies, setStudies] = useState<SavedStudy[]>([])
+  const [savedFlash, setSavedFlash] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // Load saved studies from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw) as SavedStudy[]
+        setStudies(parsed)
+      }
+    } catch (e) {
+      console.warn('Could not load saved studies:', e)
+    }
+  }, [])
+
+  const persistStudies = (list: SavedStudy[]) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
+    } catch (e) {
+      console.warn('Could not persist studies:', e)
+    }
+  }
 
   const handleFile = (f: File) => {
     setFile(f)
@@ -77,20 +118,15 @@ function App() {
       const form = new FormData()
       form.append('file', file)
 
-      const res = await fetch(`${API_BASE}/predict`, {
-        method: 'POST',
-        body: form,
-      })
+      const res = await fetch(`${API_BASE}/predict`, { method: 'POST', body: form })
 
       if (!res.ok) {
-        throw new Error(
-          `Server error (HTTP ${res.status}). The backend may still be starting. Wait 5 seconds and try again.`
-        )
+        throw new Error(`Server error (HTTP ${res.status}). Please try again.`)
       }
 
       const raw = await res.text()
       if (!raw || raw.trim() === '') {
-        throw new Error('Empty response from server. Please try again.')
+        throw new Error('Empty response. Please try again.')
       }
       if (raw.trim() === 'null') {
         throw new Error('Backend returned no data. Please try again.')
@@ -119,6 +155,90 @@ function App() {
     }
   }
 
+  // Create a tiny thumbnail from the preview image
+  const makeThumbnail = async (dataUrl: string): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const img = new Image()
+      img.onload = () => {
+        const size = 160
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return resolve(null)
+        // Cover-fit
+        const scale = Math.max(size / img.width, size / img.height)
+        const w = img.width * scale
+        const h = img.height * scale
+        ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h)
+        resolve(canvas.toDataURL('image/jpeg', 0.7))
+      }
+      img.onerror = () => resolve(null)
+      img.src = dataUrl
+    })
+  }
+
+  const saveCurrentStudy = async () => {
+    if (!result || result.rejected || !result.top_finding) return
+
+    let thumbnail: string | null = null
+    if (preview) {
+      thumbnail = await makeThumbnail(preview)
+    }
+
+    const study: SavedStudy = {
+      id: `s_${Date.now()}`,
+      timestamp: Date.now(),
+      filename: result.filename,
+      thumbnail,
+      threshold: result.threshold ?? 0.5,
+      top_finding: result.top_finding,
+      top_score: result.top_score ?? 0,
+      flagged: result.flagged ?? false,
+      findings: result.findings,
+    }
+
+    const next = [study, ...studies].slice(0, MAX_STUDIES)
+    setStudies(next)
+    persistStudies(next)
+    setSavedFlash(true)
+    setTimeout(() => setSavedFlash(false), 1500)
+  }
+
+  const loadStudy = (s: SavedStudy) => {
+    // Reconstruct a minimal PredictResponse from the saved study
+    const reconstructed: PredictResponse = {
+      filename: s.filename,
+      rejected: false,
+      threshold: s.threshold,
+      top_finding: s.top_finding,
+      top_score: s.top_score,
+      flagged: s.flagged,
+      findings: s.findings,
+      heatmap_base64: null,
+      heatmaps: {},
+      mc_passes: 10,
+    }
+    setResult(reconstructed)
+    setPreview(s.thumbnail)
+    setFile(null)
+    setShowHeatmap(false)
+    setSelectedFinding(null)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const deleteStudy = (id: string) => {
+    const next = studies.filter((s) => s.id !== id)
+    setStudies(next)
+    persistStudies(next)
+  }
+
+  const clearAllStudies = () => {
+    if (!confirm('Delete all saved studies? This cannot be undone.')) return
+    setStudies([])
+    persistStudies([])
+  }
+
   const clear = () => {
     setFile(null)
     setPreview(null)
@@ -129,7 +249,6 @@ function App() {
     if (inputRef.current) inputRef.current.value = ''
   }
 
-  // Which heatmap to display
   const currentHeatmap = (() => {
     if (!result?.heatmaps) return result?.heatmap_base64 ?? null
     if (selectedFinding && result.heatmaps[selectedFinding]) {
@@ -143,6 +262,22 @@ function App() {
     showHeatmap && hasAnyHeatmap
       ? `data:image/png;base64,${currentHeatmap}`
       : preview
+
+  const lowConfidenceCount = result?.findings
+    ? result.findings.filter(
+        (f) => f.confidence === 'low' && f.score >= (result.threshold ?? 0.5)
+      ).length
+    : 0
+
+  const formatTime = (ts: number) => {
+    const d = new Date(ts)
+    return d.toLocaleString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -243,11 +378,13 @@ function App() {
 
                 <div className="flex gap-2 mt-4 text-[10px] font-mono text-slate-500">
                   <span className="px-2 py-1 bg-slate-100 rounded">
-                    {file?.name.slice(0, 24)}
+                    {file?.name.slice(0, 24) ?? result?.filename.slice(0, 24) ?? 'saved'}
                   </span>
-                  <span className="px-2 py-1 bg-slate-100 rounded">
-                    {file ? (file.size / 1024).toFixed(0) : '0'} KB
-                  </span>
+                  {file && (
+                    <span className="px-2 py-1 bg-slate-100 rounded">
+                      {(file.size / 1024).toFixed(0)} KB
+                    </span>
+                  )}
                 </div>
               </div>
             )}
@@ -258,7 +395,7 @@ function App() {
                 disabled={!file || loading}
                 className="flex-1 bg-blue-600 text-white px-5 py-3 rounded-md font-medium text-sm hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed transition-colors"
               >
-                {loading ? 'Analyzing...' : 'Run AI Analysis'}
+                {loading ? 'Analyzing (10 MC passes)...' : 'Run AI Analysis'}
               </button>
               {preview && (
                 <button
@@ -270,6 +407,19 @@ function App() {
                 </button>
               )}
             </div>
+
+            {result && !result.rejected && (
+              <button
+                onClick={saveCurrentStudy}
+                className={`mt-3 w-full px-5 py-3 rounded-md font-medium text-sm transition-colors ${
+                  savedFlash
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-slate-900 text-white hover:bg-slate-800'
+                }`}
+              >
+                {savedFlash ? '✓ Saved to Recent Studies' : 'Save Study'}
+              </button>
+            )}
 
             {error && (
               <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
@@ -292,7 +442,7 @@ function App() {
 
             {loading && (
               <div className="bg-white border border-slate-200 rounded-lg p-12 text-center text-slate-500 text-sm">
-                Checking modality and running inference...
+                Running 10 MC Dropout passes and generating heatmaps...
               </div>
             )}
 
@@ -324,6 +474,24 @@ function App() {
 
             {result && !result.rejected && (
               <div>
+                {lowConfidenceCount > 0 && (
+                  <div className="mb-5 p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-3">
+                    <span className="text-amber-700 font-bold text-base leading-none mt-0.5">
+                      !
+                    </span>
+                    <div className="text-xs text-amber-800">
+                      <div className="font-semibold mb-0.5">
+                        Low confidence on {lowConfidenceCount} flagged finding
+                        {lowConfidenceCount > 1 ? 's' : ''}
+                      </div>
+                      <div className="text-amber-700">
+                        High variance detected across MC passes. Radiologist review
+                        recommended for flagged findings with LOW confidence.
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 <div
                   className={`mb-5 p-4 rounded-lg flex items-center gap-3 text-sm font-medium ${
                     result.flagged
@@ -341,15 +509,20 @@ function App() {
                   </span>
                 </div>
 
-                <div className="flex gap-2 mb-3 text-[10px] font-mono">
+                <div className="flex flex-wrap gap-2 mb-3 text-[10px] font-mono">
                   <span className="px-2 py-1 bg-slate-900 text-white rounded">
                     DENSENET-121
                   </span>
-                  <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded">
-                    {result.elapsed_ms?.toFixed(0)} ms
-                  </span>
+                  {result.elapsed_ms !== undefined && (
+                    <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded">
+                      {result.elapsed_ms.toFixed(0)} ms
+                    </span>
+                  )}
                   <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded">
                     18 LABELS
+                  </span>
+                  <span className="px-2 py-1 bg-violet-50 text-violet-700 rounded">
+                    MC×{result.mc_passes ?? 10}
                   </span>
                   {result.modality && (
                     <span className="px-2 py-1 bg-emerald-50 text-emerald-700 rounded">
@@ -359,7 +532,9 @@ function App() {
                 </div>
 
                 <div className="text-xs text-slate-500 mb-3 italic">
-                  Click any finding to see its attention map on the radiograph.
+                  Click any finding with a blue dot to see its attention map.
+                  <span className="font-mono"> ± </span>
+                  values show model uncertainty.
                 </div>
 
                 <div className="bg-white border border-slate-200 rounded-lg p-4">
@@ -378,6 +553,19 @@ function App() {
                         : f.severity === 'moderate'
                         ? 'bg-amber-50 text-amber-800'
                         : 'bg-slate-100 text-slate-600'
+                    const confClass =
+                      f.confidence === 'high'
+                        ? 'text-emerald-700'
+                        : f.confidence === 'medium'
+                        ? 'text-amber-700'
+                        : 'text-red-600'
+
+                    const meanPct = f.score * 100
+                    const stdPct = (f.std ?? 0) * 100
+                    const low = Math.max(0, meanPct - stdPct)
+                    const high = Math.min(100, meanPct + stdPct)
+                    const bandWidth = high - low
+
                     return (
                       <div
                         key={f.label}
@@ -387,7 +575,7 @@ function App() {
                             setShowHeatmap(true)
                           }
                         }}
-                        className={`grid grid-cols-[1fr_auto_60px_80px] items-center gap-4 py-2 border-b border-slate-100 last:border-0 px-2 rounded transition-colors ${
+                        className={`grid grid-cols-[1fr_auto_60px_65px_80px] items-center gap-3 py-2 border-b border-slate-100 last:border-0 px-2 rounded transition-colors ${
                           hasHeatmap
                             ? 'cursor-pointer hover:bg-blue-50'
                             : 'cursor-default'
@@ -403,14 +591,26 @@ function App() {
                           )}
                           {f.label}
                         </div>
-                        <div className="w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+
+                        <div className="relative w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                           <div
-                            className={`h-full ${barColor}`}
-                            style={{ width: `${f.score * 100}%` }}
+                            className="absolute top-0 h-full bg-blue-100"
+                            style={{
+                              left: `${low}%`,
+                              width: `${bandWidth}%`,
+                            }}
+                          ></div>
+                          <div
+                            className={`absolute top-0 left-0 h-full ${barColor}`}
+                            style={{ width: `${meanPct}%` }}
                           />
                         </div>
+
                         <div className="text-xs font-mono text-slate-900 text-right">
-                          {(f.score * 100).toFixed(1)}%
+                          {meanPct.toFixed(1)}%
+                        </div>
+                        <div className={`text-[10px] font-mono text-right ${confClass}`}>
+                          ±{stdPct.toFixed(1)}
                         </div>
                         <div className="text-right">
                           <span
@@ -423,10 +623,99 @@ function App() {
                     )
                   })}
                 </div>
+
+                <div className="mt-4 text-[10px] text-slate-500 leading-relaxed">
+                  <div className="font-mono uppercase tracking-wider mb-1">
+                    About the uncertainty metric
+                  </div>
+                  <div>
+                    ± value is the standard deviation across {result.mc_passes ?? 10} Monte Carlo
+                    Dropout passes. <span className="text-emerald-700 font-medium">Low</span> std
+                    means the model is confident. <span className="text-red-600 font-medium">High</span>{' '}
+                    std means it is uncertain.
+                  </div>
+                </div>
               </div>
             )}
           </section>
         </div>
+
+        {/* Recent Studies */}
+        {studies.length > 0 && (
+          <section className="mt-12">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <div className="text-[10px] font-semibold text-slate-500 tracking-[0.14em] uppercase">
+                  Recent Studies
+                </div>
+                <div className="text-xs text-slate-400 mt-1">
+                  {studies.length} saved on this device
+                </div>
+              </div>
+              <button
+                onClick={clearAllStudies}
+                className="text-xs text-slate-500 hover:text-red-600 font-medium"
+              >
+                Clear all
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+              {studies.map((s) => (
+                <div
+                  key={s.id}
+                  className="bg-white border border-slate-200 rounded-lg overflow-hidden hover:border-blue-400 transition-colors group"
+                >
+                  <button
+                    onClick={() => loadStudy(s)}
+                    className="w-full text-left"
+                  >
+                    <div className="aspect-square bg-slate-100 overflow-hidden">
+                      {s.thumbnail ? (
+                        <img
+                          src={s.thumbnail}
+                          alt={s.filename}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-slate-400 text-xs">
+                          no image
+                        </div>
+                      )}
+                    </div>
+                    <div className="p-3">
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span
+                          className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                            s.flagged ? 'bg-red-500' : 'bg-emerald-500'
+                          }`}
+                        ></span>
+                        <div className="text-xs font-medium text-slate-800 truncate">
+                          {s.top_finding}
+                        </div>
+                      </div>
+                      <div className="text-[10px] font-mono text-slate-500">
+                        {(s.top_score * 100).toFixed(1)}% · {formatTime(s.timestamp)}
+                      </div>
+                    </div>
+                  </button>
+                  <div className="border-t border-slate-100 px-3 py-1.5 flex justify-end">
+                    <button
+                      onClick={() => deleteStudy(s.id)}
+                      className="text-[10px] text-slate-400 hover:text-red-600 font-medium"
+                    >
+                      delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-3 text-[10px] text-slate-400 font-mono">
+              Studies stored locally in your browser · {MAX_STUDIES} max
+            </div>
+          </section>
+        )}
 
         <div className="mt-12 text-[10px] text-slate-400 font-mono tracking-wider flex justify-between">
           <span>NAVANTIX PULMO v1.0 · RESEARCH PROTOTYPE · NOT FOR CLINICAL USE</span>
